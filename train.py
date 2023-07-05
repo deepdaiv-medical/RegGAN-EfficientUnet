@@ -2,14 +2,14 @@
 
 import argparse
 import os
-from trainer import Cyc_Trainer,Nice_Trainer,P2p_Trainer,Munit_Trainer,Unit_Trainer
+from trainer import Cyc_Trainer
 import yaml
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "2"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 def get_config(config):
     with open(config, 'r') as stream:
-        return yaml.load(stream)
+        return yaml.safe_load(stream)
 
 def main():
     parser = argparse.ArgumentParser()
@@ -19,16 +19,16 @@ def main():
     
     if config['name'] == 'CycleGan':
         trainer = Cyc_Trainer(config)
-    elif config['name'] == 'Munit':
-        trainer = Munit_Trainer(config)
-    elif config['name'] == 'Unit':
-        trainer = Unit_Trainer(config)
-    elif config['name'] == 'NiceGAN':
-        trainer = Nice_Trainer(config)
-    elif config['name'] == 'U-gat':
-        trainer = Ugat_Trainer(config)
-    elif config['name'] == 'P2p':
-        trainer = P2p_Trainer(config)
+    # elif config['name'] == 'Munit':
+    #     trainer = Munit_Trainer(config)
+    # elif config['name'] == 'Unit':
+    #     trainer = Unit_Trainer(config)
+    # elif config['name'] == 'NiceGAN':
+    #     trainer = Nice_Trainer(config)
+    # elif config['name'] == 'U-gat':
+    #     trainer = Ugat_Trainer(config)
+    # elif config['name'] == 'P2p':
+    #     trainer = P2p_Trainer(config)
 
     trainer.train()
     

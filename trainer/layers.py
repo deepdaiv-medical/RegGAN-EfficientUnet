@@ -1,72 +1,241 @@
-from functools import partial
-
+import math
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
-from torch import nn
-
-scale_eval = False
-
-alpha = 0.02
-beta = 0.00002
-
-resnet_n_blocks = 1
-
-norm_layer = partial(nn.InstanceNorm2d, affine=False, track_running_stats=False)
-align_corners = False
-up_sample_mode = 'bilinear'
 
 
-def custom_init(m):
-    m.data.normal_(0.0, alpha)
+class Swish(nn.Module):
+    def __init__(self, name=None):
+        super().__init__()
+        self.name = name
+
+    def forward(self, x):
+        return x * torch.sigmoid(x)
 
 
-def get_init_function(activation, init_function, **kwargs):
-    """Get the initialization function from the given name."""
-    a = 0.0
-    if activation == 'leaky_relu':
-        a = 0.2 if 'negative_slope' not in kwargs else kwargs['negative_slope']
+class Conv2dSamePadding(nn.Conv2d):
+    """2D Convolutions with same padding
+    """
 
-    gain = 0.02 if 'gain' not in kwargs else kwargs['gain']
-    if isinstance(init_function, str):
-        if init_function == 'kaiming':
-            activation = 'relu' if activation is None else activation
-            return partial(torch.nn.init.kaiming_normal_, a=a, nonlinearity=activation, mode='fan_in')
-        elif init_function == 'dirac':
-            return torch.nn.init.dirac_
-        elif init_function == 'xavier':
-            activation = 'relu' if activation is None else activation
-            gain = torch.nn.init.calculate_gain(nonlinearity=activation, param=a)
-            return partial(torch.nn.init.xavier_normal_, gain=gain)
-        elif init_function == 'normal':
-            return partial(torch.nn.init.normal_, mean=0.0, std=gain)
-        elif init_function == 'orthogonal':
-            return partial(torch.nn.init.orthogonal_, gain=gain)
-        elif init_function == 'zeros':
-            return partial(torch.nn.init.normal_, mean=0.0, std=1e-5)
-    elif init_function is None:
-        if activation in ['relu', 'leaky_relu']:
-            return partial(torch.nn.init.kaiming_normal_, a=a, nonlinearity=activation)
-        if activation in ['tanh', 'sigmoid']:
-            gain = torch.nn.init.calculate_gain(nonlinearity=activation, param=a)
-            return partial(torch.nn.init.xavier_normal_, gain=gain)
-    else:
-        return init_function
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, dilation=1, groups=1, bias=True, name=None):
+        super().__init__(in_channels, out_channels, kernel_size, stride, padding=0, dilation=dilation, groups=groups,
+                         bias=bias)
+        self.stride = self.stride if len(self.stride) == 2 else [self.stride[0]] * 2
+        self.name = name
+
+    def forward(self, x):
+        input_h, input_w = x.size()[2:]
+        kernel_h, kernel_w = self.weight.size()[2:]
+        stride_h, stride_w = self.stride
+        output_h, output_w = math.ceil(input_h / stride_h), math.ceil(input_w / stride_w)
+        pad_h = max((output_h - 1) * self.stride[0] + (kernel_h - 1) * self.dilation[0] + 1 - input_h, 0)
+        pad_w = max((output_w - 1) * self.stride[1] + (kernel_w - 1) * self.dilation[1] + 1 - input_w, 0)
+        if pad_h > 0 or pad_w > 0:
+            x = F.pad(x, [pad_w // 2, pad_w - pad_w // 2, pad_h // 2, pad_h - pad_h // 2])
+        return F.conv2d(x, self.weight, self.bias, self.stride, self.padding, self.dilation, self.groups)
 
 
-def get_activation(activation, **kwargs):
-    """Get the appropriate activation from the given name"""
-    if activation == 'relu':
-        return nn.ReLU(inplace=False)
-    elif activation == 'leaky_relu':
-        negative_slope = 0.2 if 'negative_slope' not in kwargs else kwargs['negative_slope']
-        return nn.LeakyReLU(negative_slope=negative_slope, inplace=False)
-    elif activation == 'tanh':
-        return nn.Tanh()
-    elif activation == 'sigmoid':
-        return nn.Sigmoid()
-    else:
-        return None
+class BatchNorm2d(nn.BatchNorm2d):
+    def __init__(self, num_features, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True, name=None):
+        super().__init__(num_features, eps=eps, momentum=momentum, affine=affine,
+                         track_running_stats=track_running_stats)
+        self.name = name
 
+
+def drop_connect(inputs, drop_connect_rate, training):
+    if not training:
+        return inputs
+    batch_size = inputs.shape[0]
+    keep_prob = 1.0 - drop_connect_rate
+    random_tensor = keep_prob
+    random_tensor += torch.rand([batch_size, 1, 1, 1], dtype=inputs.dtype, device=inputs.device)
+    binary_tensor = torch.floor(random_tensor)
+    output = inputs / keep_prob * binary_tensor
+    return output
+
+
+class MBConvBlock(nn.Module):
+    """Mobile Inverted Residual Bottleneck Block
+    """
+
+    def __init__(self, block_args, global_params, idx):
+        super().__init__()
+
+        block_name = 'blocks_' + str(idx) + '_'
+
+        self.block_args = block_args
+        self.batch_norm_momentum = 1 - global_params.batch_norm_momentum
+        self.batch_norm_epsilon = global_params.batch_norm_epsilon
+        self.has_se = (self.block_args.se_ratio is not None) and (0 < self.block_args.se_ratio <= 1)
+        self.id_skip = block_args.id_skip
+
+        self.swish = Swish(block_name + '_swish')
+
+        # Expansion phase
+        in_channels = self.block_args.input_filters
+        out_channels = self.block_args.input_filters * self.block_args.expand_ratio
+        if self.block_args.expand_ratio != 1:
+            self._expand_conv = Conv2dSamePadding(in_channels=in_channels,
+                                                  out_channels=out_channels,
+                                                  kernel_size=1,
+                                                  bias=False,
+                                                  name=block_name + 'expansion_conv')
+            self._bn0 = BatchNorm2d(num_features=out_channels,
+                                    momentum=self.batch_norm_momentum,
+                                    eps=self.batch_norm_epsilon,
+                                    name=block_name + 'expansion_batch_norm')
+
+        # Depth-wise convolution phase
+        kernel_size = self.block_args.kernel_size
+        strides = self.block_args.strides
+        self._depthwise_conv = Conv2dSamePadding(in_channels=out_channels,
+                                                 out_channels=out_channels,
+                                                 groups=out_channels,
+                                                 kernel_size=kernel_size,
+                                                 stride=strides,
+                                                 bias=False,
+                                                 name=block_name + 'depthwise_conv')
+        self._bn1 = BatchNorm2d(num_features=out_channels,
+                                momentum=self.batch_norm_momentum,
+                                eps=self.batch_norm_epsilon,
+                                name=block_name + 'depthwise_batch_norm')
+
+        # Squeeze and Excitation layer
+        if self.has_se:
+            num_squeezed_channels = max(1, int(self.block_args.input_filters * self.block_args.se_ratio))
+            self._se_reduce = Conv2dSamePadding(in_channels=out_channels,
+                                                out_channels=num_squeezed_channels,
+                                                kernel_size=1,
+                                                name=block_name + 'se_reduce')
+            self._se_expand = Conv2dSamePadding(in_channels=num_squeezed_channels,
+                                                out_channels=out_channels,
+                                                kernel_size=1,
+                                                name=block_name + 'se_expand')
+
+        # Output phase
+        final_output_channels = self.block_args.output_filters
+        self._project_conv = Conv2dSamePadding(in_channels=out_channels,
+                                               out_channels=final_output_channels,
+                                               kernel_size=1,
+                                               bias=False,
+                                               name=block_name + 'output_conv')
+        self._bn2 = BatchNorm2d(num_features=final_output_channels,
+                                momentum=self.batch_norm_momentum,
+                                eps=self.batch_norm_epsilon,
+                                name=block_name + 'output_batch_norm')
+
+    def forward(self, x, drop_connect_rate=None):
+        identity = x
+        # Expansion and depth-wise convolution
+        if self.block_args.expand_ratio != 1:
+            x = self._expand_conv(x)
+            x = self._bn0(x)
+            x = self.swish(x)
+
+        x = self._depthwise_conv(x)
+        x = self._bn1(x)
+        x = self.swish(x)
+
+        # Squeeze and Excitation
+        if self.has_se:
+            x_squeezed = F.adaptive_avg_pool2d(x, 1)
+            x_squeezed = self._se_expand(self.swish(self._se_reduce(x_squeezed)))
+            x = torch.sigmoid(x_squeezed) * x
+
+        x = self._bn2(self._project_conv(x))
+
+        # Skip connection and drop connect
+        input_filters, output_filters = self.block_args.input_filters, self.block_args.output_filters
+        if self.id_skip and self.block_args.strides == 1 and input_filters == output_filters:
+            if drop_connect_rate:
+                x = drop_connect(x, drop_connect_rate=drop_connect_rate, training=self.training)
+            x = x + identity
+        return x
+
+
+def double_conv(in_channels, out_channels):
+    return nn.Sequential(
+        nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1),
+        nn.BatchNorm2d(out_channels),
+        nn.ReLU(inplace=True),
+        nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1),
+        nn.BatchNorm2d(out_channels),
+        nn.ReLU(inplace=True)
+    )
+
+
+def up_conv(in_channels, out_channels):
+    return nn.ConvTranspose2d(
+        in_channels, out_channels, kernel_size=2, stride=2
+    )
+
+
+def custom_head(in_channels, out_channels):
+    return nn.Sequential(
+        nn.Dropout(),
+        nn.Linear(in_channels, 512),
+        nn.ReLU(inplace=True),
+        nn.Dropout(),
+        nn.Linear(512, out_channels)
+    )
+
+class DownBlock(torch.nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, bias=False, activation='relu',
+                 init_func='kaiming', use_norm=False, use_resnet=False, skip=True, refine=False, pool=True,
+                 pool_size=2, **kwargs):
+        super(DownBlock, self).__init__()
+        self.conv_0 = Conv(in_channels, out_channels, kernel_size, stride, padding, bias=bias,
+                           activation=activation, init_func=init_func, use_norm=use_norm, callback=None,
+                           use_resnet=use_resnet, **kwargs)
+        self.conv_1 = None
+        if refine:
+            self.conv_1 = Conv(out_channels, out_channels, kernel_size, stride, padding, bias=bias,
+                               activation=activation, init_func=init_func, use_norm=use_norm, callback=None,
+                               use_resnet=use_resnet, **kwargs)
+        self.skip = skip
+        self.pool = None
+        if pool:
+            self.pool = nn.MaxPool2d(kernel_size=pool_size)
+
+    def forward(self, x):
+        x = skip = self.conv_0(x)
+        if self.conv_1 is not None:
+            x = skip = self.conv_1(x)
+        if self.pool is not None:
+            x = self.pool(x)
+        if self.skip:
+            return x, skip
+        else:
+            return x
+
+class AttentionGate(torch.nn.Module):
+    def __init__(self, nc_g, nc_x, nc_inner, use_norm=False, init_func='kaiming', mask_channel_wise=False):
+        super(AttentionGate, self).__init__()
+        self.conv_g = Conv(nc_g, nc_inner, 1, 1, 0, bias=True, activation=None, init_func=init_func,
+                           use_norm=use_norm, use_resnet=False)
+        self.conv_x = Conv(nc_x, nc_inner, 1, 1, 0, bias=False, activation=None, init_func=init_func,
+                           use_norm=use_norm, use_resnet=False)
+        self.residual = nn.ReLU(inplace=True)
+        self.mask_channel_wise = mask_channel_wise
+        self.attention_map = Conv(nc_inner, nc_x if mask_channel_wise else 1, 1, 1, 0, bias=True, activation='sigmoid',
+                                  init_function=init_func, use_norm=use_norm, use_resnet=False)
+
+    def forward(self, g, x):
+        x_size = x.size()
+        g_size = g.size()
+        x_resized = x
+        g_c = self.conv_g(g)
+        x_c = self.conv_x(x_resized)
+        if x_c.size(2) != g_size[2] and x_c.size(3) != g_size[3]:
+            x_c = F.interpolate(x_c, (g_size[2], g_size[3]), mode=up_sample_mode, align_corners=align_corners)
+        combined = self.residual(g_c + x_c)
+        alpha = self.attention_map(combined)
+        if not self.mask_channel_wise:
+            alpha = alpha.repeat(1, x_size[1], 1, 1)
+        alpha_size = alpha.size()
+        if alpha_size[2] != x_size[2] and alpha_size[3] != x_size[3]:
+            alpha = F.interpolate(x, (x_size[2], x_size[3]), mode=up_sample_mode, align_corners=align_corners)
+        return alpha * x
 
 class Conv(torch.nn.Module):
     """Defines a basic convolution layer.
@@ -103,116 +272,6 @@ class Conv(torch.nn.Module):
             x = self.resnet_block(x)
         return x
 
-
-class UpBlock(torch.nn.Module):
-    def __init__(self, nc_down_stream, nc_skip_stream, nc_out, kernel_size, stride, padding, bias=True,
-                 activation='relu',
-                 init_func='kaiming', use_norm=False, refine=False, use_resnet=False, use_add=False,
-                 use_attention=False, **kwargs):
-        super(UpBlock, self).__init__()
-        if 'nc_inner' in kwargs:
-            nc_inner = kwargs['nc_inner']
-        else:
-            nc_inner = nc_out
-        self.conv_0 = Conv(nc_down_stream + nc_skip_stream, nc_inner, kernel_size=kernel_size, stride=stride,
-                           padding=padding, bias=bias, activation=activation, init_func=init_func, use_norm=use_norm,
-                           use_resnet=use_resnet, **kwargs)
-        self.conv_1 = None
-        if refine:
-            self.conv_1 = Conv(nc_inner, nc_inner, kernel_size=kernel_size, stride=stride, padding=padding, bias=bias,
-                               activation=activation, init_func=init_func, use_norm=use_norm, use_resnet=use_resnet,
-                               **kwargs)
-        self.use_attention = use_attention
-        if self.use_attention:
-            self.attention_gate = AttentionGate(nc_down_stream, nc_skip_stream, nc_inner, use_norm=True,
-                                                init_func=init_func)
-        self.up_conv = Conv(nc_inner, nc_out, kernel_size=kernel_size, stride=stride, padding=padding, bias=bias,
-                            activation=activation, init_func=init_func, use_norm=use_norm, use_resnet=False, **kwargs)
-        self.use_add = use_add
-        if self.use_add:
-            self.output = Conv(nc_out, 2, kernel_size=1, stride=1, padding=0, bias=bias, activation=None,
-                               init_func='zeros',
-                               use_norm=False, use_resnet=False)
-
-    def forward(self, down_stream, skip_stream):
-        down_stream_size = down_stream.size()
-        skip_stream_size = skip_stream.size()
-        if self.use_attention:
-            skip_stream = self.attention_gate(down_stream, skip_stream)
-        if down_stream_size[2] != skip_stream_size[2] or down_stream_size[3] != skip_stream_size[3]:
-            down_stream = F.interpolate(down_stream, (skip_stream_size[2], skip_stream_size[3]),
-                                        mode=up_sample_mode, align_corners=align_corners)
-        x = torch.cat([down_stream, skip_stream], 1)
-        x = self.conv_0(x)
-        if self.conv_1 is not None:
-            x = self.conv_1(x)
-        if self.use_add:
-            x = self.output(x) + down_stream
-        else:
-            x = self.up_conv(x)
-        return x
-
-
-class DownBlock(torch.nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, bias=False, activation='relu',
-                 init_func='kaiming', use_norm=False, use_resnet=False, skip=True, refine=False, pool=True,
-                 pool_size=2, **kwargs):
-        super(DownBlock, self).__init__()
-        self.conv_0 = Conv(in_channels, out_channels, kernel_size, stride, padding, bias=bias,
-                           activation=activation, init_func=init_func, use_norm=use_norm, callback=None,
-                           use_resnet=use_resnet, **kwargs)
-        self.conv_1 = None
-        if refine:
-            self.conv_1 = Conv(out_channels, out_channels, kernel_size, stride, padding, bias=bias,
-                               activation=activation, init_func=init_func, use_norm=use_norm, callback=None,
-                               use_resnet=use_resnet, **kwargs)
-        self.skip = skip
-        self.pool = None
-        if pool:
-            self.pool = nn.MaxPool2d(kernel_size=pool_size)
-
-    def forward(self, x):
-        x = skip = self.conv_0(x)
-        if self.conv_1 is not None:
-            x = skip = self.conv_1(x)
-        if self.pool is not None:
-            x = self.pool(x)
-        if self.skip:
-            return x, skip
-        else:
-            return x
-
-
-class AttentionGate(torch.nn.Module):
-    def __init__(self, nc_g, nc_x, nc_inner, use_norm=False, init_func='kaiming', mask_channel_wise=False):
-        super(AttentionGate, self).__init__()
-        self.conv_g = Conv(nc_g, nc_inner, 1, 1, 0, bias=True, activation=None, init_func=init_func,
-                           use_norm=use_norm, use_resnet=False)
-        self.conv_x = Conv(nc_x, nc_inner, 1, 1, 0, bias=False, activation=None, init_func=init_func,
-                           use_norm=use_norm, use_resnet=False)
-        self.residual = nn.ReLU(inplace=True)
-        self.mask_channel_wise = mask_channel_wise
-        self.attention_map = Conv(nc_inner, nc_x if mask_channel_wise else 1, 1, 1, 0, bias=True, activation='sigmoid',
-                                  init_function=init_func, use_norm=use_norm, use_resnet=False)
-
-    def forward(self, g, x):
-        x_size = x.size()
-        g_size = g.size()
-        x_resized = x
-        g_c = self.conv_g(g)
-        x_c = self.conv_x(x_resized)
-        if x_c.size(2) != g_size[2] and x_c.size(3) != g_size[3]:
-            x_c = F.interpolate(x_c, (g_size[2], g_size[3]), mode=up_sample_mode, align_corners=align_corners)
-        combined = self.residual(g_c + x_c)
-        alpha = self.attention_map(combined)
-        if not self.mask_channel_wise:
-            alpha = alpha.repeat(1, x_size[1], 1, 1)
-        alpha_size = alpha.size()
-        if alpha_size[2] != x_size[2] and alpha_size[3] != x_size[3]:
-            alpha = F.interpolate(x, (x_size[2], x_size[3]), mode=up_sample_mode, align_corners=align_corners)
-        return alpha * x
-
-
 class ResnetTransformer(torch.nn.Module):
     def __init__(self, dim, n_blocks, init_func):
         super(ResnetTransformer, self).__init__()
@@ -238,63 +297,3 @@ class ResnetTransformer(torch.nn.Module):
 
     def forward(self, x):
         return self.model(x)
-
-
-class ResnetBlock(nn.Module):
-    """Define a Resnet block"""
-
-    def __init__(self, dim, padding_type, norm_layer, use_dropout, use_bias):
-        """Initialize the Resnet block
-
-        A resnet block is a conv block with skip connections
-        We construct a conv block with build_conv_block function,
-        and implement skip connections in <forward> function.
-        Original Resnet paper: https://arxiv.org/pdf/1512.03385.pdf
-        """
-        super(ResnetBlock, self).__init__()
-        self.conv_block = self.build_conv_block(dim, padding_type, norm_layer, use_dropout, use_bias)
-
-    def build_conv_block(self, dim, padding_type, norm_layer, use_dropout, use_bias):
-        """Construct a convolutional block.
-
-        Parameters:
-            dim (int)           -- the number of channels in the conv layer.
-            padding_type (str)  -- the name of padding layer: reflect | replicate | zero
-            norm_layer          -- normalization layer
-            use_dropout (bool)  -- if use dropout layers.
-            use_bias (bool)     -- if the conv layer uses bias or not
-
-        Returns a conv block (with a conv layer, a normalization layer, and a non-linearity layer (ReLU))
-        """
-        conv_block = []
-        p = 0
-        if padding_type == 'reflect':
-            conv_block += [nn.ReflectionPad2d(1)]
-        elif padding_type == 'replicate':
-            conv_block += [nn.ReplicationPad2d(1)]
-        elif padding_type == 'zero':
-            p = 1
-        else:
-            raise NotImplementedError('padding [%s] is not implemented' % padding_type)
-
-        conv_block += [nn.Conv2d(dim, dim, kernel_size=3, padding=p, bias=use_bias), norm_layer(dim), nn.ReLU(True)]
-        if use_dropout:
-            conv_block += [nn.Dropout(0.5)]
-
-        p = 0
-        if padding_type == 'reflect':
-            conv_block += [nn.ReflectionPad2d(1)]
-        elif padding_type == 'replicate':
-            conv_block += [nn.ReplicationPad2d(1)]
-        elif padding_type == 'zero':
-            p = 1
-        else:
-            raise NotImplementedError('padding [%s] is not implemented' % padding_type)
-        conv_block += [nn.Conv2d(dim, dim, kernel_size=3, padding=p, bias=use_bias), norm_layer(dim)]
-
-        return nn.Sequential(*conv_block)
-
-    def forward(self, x):
-        """Forward function (with skip connections)"""
-        out = x + self.conv_block(x)  # add skip connections
-        return out

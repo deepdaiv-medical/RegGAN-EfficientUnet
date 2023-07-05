@@ -11,6 +11,13 @@ import torch.nn.functional as F
 from .layers import DownBlock, Conv, ResnetTransformer
 sampling_align_corners = False
 
+from collections import OrderedDict
+from .layers import *
+
+#EfficientNet
+from .efficientnet import EfficientNet
+from .efficientunet import EfficientUnet
+
 # The number of filters in each block of the encoding part (down-sampling).
 ndf = {'A': [32, 64, 64, 64, 64, 64, 64], }
 # The number of filters in each block of the decoding part (up-sampling).
@@ -27,79 +34,87 @@ down_activation = {'A': 'leaky_relu', }
 # The activation used in the up-sampling path.
 up_activation = {'A': 'leaky_relu', }
 
+def get_efficientunet_b7(out_channels=2, concat_input=True, pretrained=True):
+    encoder = EfficientNet.encoder('efficientnet-b7', pretrained=pretrained)
+    model = ResUnet(self, out_channels, 0, 'A', 'kaiming', True)
+        
+    return model
 
 class ResUnet(torch.nn.Module):
-    def __init__(self, nc_a, nc_b, cfg, init_func, init_to_identity):
-        super(ResUnet, self).__init__()
-        act = down_activation[cfg]
-        # ------------ Down-sampling path
-        self.ndown_blocks = len(ndf[cfg])
-        self.nup_blocks = len(nuf[cfg])
-        assert self.ndown_blocks >= self.nup_blocks
-        in_nf = nc_a + nc_b
-        conv_num = 1
-        skip_nf = {}
-        for out_nf in ndf[cfg]:
-            setattr(self, 'down_{}'.format(conv_num),
-                    DownBlock(in_nf, out_nf, 3, 1, 1, activation=act, init_func=init_func, bias=True,
-                              use_resnet=use_down_resblocks[cfg], use_norm=False))
-            skip_nf['down_{}'.format(conv_num)] = out_nf
-            in_nf = out_nf
-            conv_num += 1
-        conv_num -= 1
-        if use_down_resblocks[cfg]:
-            self.c1 = Conv(in_nf, 2 * in_nf, 1, 1, 0, activation=act, init_func=init_func, bias=True,
-                           use_resnet=False, use_norm=False)
-            self.t = ((lambda x: x) if resnet_nblocks[cfg] == 0
-                      else ResnetTransformer(2 * in_nf, resnet_nblocks[cfg], init_func))
-            self.c2 = Conv(2 * in_nf, in_nf, 1, 1, 0, activation=act, init_func=init_func, bias=True,
-                           use_resnet=False, use_norm=False)
-        # ------------- Up-sampling path
-        act = up_activation[cfg]
-        for out_nf in nuf[cfg]:
-            setattr(self, 'up_{}'.format(conv_num),
-                    Conv(in_nf + skip_nf['down_{}'.format(conv_num)], out_nf, 3, 1, 1, bias=True, activation=act,
-                         init_fun=init_func, use_norm=False, use_resnet=False))
-            in_nf = out_nf
-            conv_num -= 1
-        if refine_output[cfg]:
-            self.refine = nn.Sequential(ResnetTransformer(in_nf, 1, init_func),
-                                        Conv(in_nf, in_nf, 1, 1, 0, use_resnet=False, init_func=init_func,
-                                             activation=act,
-                                             use_norm=False)
-                                        )
-        else:
-            self.refine = lambda x: x
-        self.output = Conv(in_nf, 2, 3, 1, 1, use_resnet=False, bias=True,
-                           init_func=('zeros' if init_to_identity else init_func), activation=None,
-                           use_norm=False)
-    def forward(self, img_a, img_b):
-        x = torch.cat([img_a, img_b], 1)
-        skip_vals = {}
-        conv_num = 1
-        # Down
-        while conv_num <= self.ndown_blocks:
-            x, skip = getattr(self, 'down_{}'.format(conv_num))(x)
-            skip_vals['down_{}'.format(conv_num)] = skip
-            conv_num += 1
-        if hasattr(self, 't'):
-            x = self.c1(x)
-            x = self.t(x)
-            x = self.c2(x)
-        # Up
-        conv_num -= 1
-        while conv_num > (self.ndown_blocks - self.nup_blocks):
-            s = skip_vals['down_{}'.format(conv_num)]
-            x = F.interpolate(x, (s.size(2), s.size(3)), mode='bilinear')
-            x = torch.cat([x, s], 1)
-            x = getattr(self, 'up_{}'.format(conv_num))(x)
-            conv_num -= 1
-        x = self.refine(x)
-        x = self.output(x)
-        return x
+    def __init__(self, nc_a, nc_b, cfg, init_func, init_to_identity, concat_input=True, out_channels=2, encoder= get_efficientunet_b7(out_channels=2, concat_input=True, pretrained=True)):
+        self.n_channels=nc_a+nc_b
+        
+        super().__init__()
 
+        self.encoder = encoder
+        self.concat_input = concat_input
+
+        self.up_conv1 = up_conv(self.n_channels, 512)
+        self.double_conv1 = double_conv(self.size[0], 512)
+        self.up_conv2 = up_conv(512, 256)
+        self.double_conv2 = double_conv(self.size[1], 256)
+        self.up_conv3 = up_conv(256, 128)
+        self.double_conv3 = double_conv(self.size[2], 128)
+        self.up_conv4 = up_conv(128, 64)
+        self.double_conv4 = double_conv(self.size[3], 64)
+
+        if self.concat_input:
+            self.up_conv_input = up_conv(64, 32)
+            self.double_conv_input = double_conv(self.size[4], 32)
+
+        self.final_conv = nn.Conv2d(self.size[5], out_channels, kernel_size=1)
+        
+    @property
+    def n_channels(self):
+        n_channels_dict = {'efficientnet-b0': 1280, 'efficientnet-b1': 1280, 'efficientnet-b2': 1408,
+                           'efficientnet-b3': 1536, 'efficientnet-b4': 1792, 'efficientnet-b5': 2048,
+                           'efficientnet-b6': 2304, 'efficientnet-b7': 2560}
+        return n_channels_dict[self.encoder.name]
+    @property
+    def size(self):
+        size_dict = {'efficientnet-b0': [592, 296, 152, 80, 35, 32], 'efficientnet-b1': [592, 296, 152, 80, 35, 32],
+                     'efficientnet-b2': [600, 304, 152, 80, 35, 32], 'efficientnet-b3': [608, 304, 160, 88, 35, 32],
+                     'efficientnet-b4': [624, 312, 160, 88, 35, 32], 'efficientnet-b5': [640, 320, 168, 88, 35, 32],
+                     'efficientnet-b6': [656, 328, 168, 96, 35, 32], 'efficientnet-b7': [672, 336, 176, 96, 35, 32]}
+        return size_dict[self.encoder.name]
+        
+    def forward(self, img_a, img_b):
+    #def forward(self, x):
+        x = torch.cat([img_a, img_b], 1)
+        input_ = x
+
+        blocks = get_blocks_to_be_concat(self.encoder, x)
+        _, x = blocks.popitem()
+
+        x = self.up_conv1(x)
+        x = torch.cat([x, blocks.popitem()[1]], dim=1)
+        x = self.double_conv1(x)
+
+        x = self.up_conv2(x)
+        x = torch.cat([x, blocks.popitem()[1]], dim=1)
+        x = self.double_conv2(x)
+
+        x = self.up_conv3(x)
+        x = torch.cat([x, blocks.popitem()[1]], dim=1)
+        x = self.double_conv3(x)
+
+        x = self.up_conv4(x)
+        x = torch.cat([x, blocks.popitem()[1]], dim=1)
+        x = self.double_conv4(x)
+
+        if self.concat_input:
+            x = self.up_conv_input(x)
+            x = torch.cat([x, input_], dim=1)
+            x = self.double_conv_input(x)
+
+        x = self.final_conv(x)
+
+        return x
+    
+
+    
 class Reg(nn.Module):
-    def __init__(self,height,width，in_channels_a,in_channels_b):
+    def __init__(self,height,width,in_channels_a,in_channels_b):
         super(Reg, self).__init__()
        #height,width=256,256
         #in_channels_a,in_channels_b=1,1
