@@ -18,9 +18,11 @@ from .transformer import Transformer_2D
 from skimage import measure
 import numpy as np
 import cv2
+import time
 
 class Cyc_Trainer():
     def __init__(self, config):
+        print("Cyc_Trainer ", config)
         super().__init__()
         self.config = config
         ## def networks
@@ -223,6 +225,7 @@ class Cyc_Trainer():
                         self.optimizer_G.zero_grad()
                         #### regist sys loss
                         fake_B = self.netG_A2B(real_A)
+                        print("Cyc train ", fake_B.shape, real_B.shape)
                         Trans = self.R_A(fake_B,real_B) 
                         SysRegist_A2B = self.spatial_transform(fake_B,Trans)
                         SR_loss = self.config['Corr_lamda'] * self.L1_loss(SysRegist_A2B,real_B)###SR
@@ -315,14 +318,34 @@ class Cyc_Trainer():
                     fake_B = fake_B.detach().cpu().numpy().squeeze()                                                 
                     mae = self.MAE(fake_B,real_B)
                     psnr = self.PSNR(fake_B,real_B)
-                    ssim = measure.compare_ssim(fake_B,real_B)
+                    # ssim = measure.compare_ssim(fake_B,real_B)
                     MAE += mae
                     PSNR += psnr
-                    SSIM += ssim 
+                    # SSIM += ssim 
                     num += 1
                 print ('MAE:',MAE/num)
                 print ('PSNR:',PSNR/num)
-                print ('SSIM:',SSIM/num)
+                # print ('SSIM:',SSIM/num)
+
+    def get_time(self,):
+        self.netG_A2B.load_state_dict(torch.load(self.config['save_root'] + 'netG_A2B.pth'))
+        total_time = 0.0
+        with torch.no_grad():
+            start_time = time.time()
+            num = 0
+            for i, batch in enumerate(self.val_data):
+                real_A = Variable(self.input_A.copy_(batch['A']))
+                real_B = Variable(self.input_B.copy_(batch['B'])).detach().cpu().numpy().squeeze()
+                    
+                fake_B = self.netG_A2B(real_A)
+                fake_B = fake_B.detach().cpu().numpy().squeeze()                                                 
+                num += 1
+            end_time = time.time()
+            iteration_time = end_time - start_time
+            total_time += iteration_time
+        average_time = total_time / num
+        print(f"평균 추론 시간: {average_time} 초")
+
     
     def PSNR(self,fake,real):
        x,y = np.where(real!= -1)# Exclude background

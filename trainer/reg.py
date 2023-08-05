@@ -13,10 +13,7 @@ sampling_align_corners = False
 
 from collections import OrderedDict
 from .layers import *
-
-#EfficientNet
 from .efficientnet import EfficientNet
-from .efficientunet import EfficientUnet
 
 # The number of filters in each block of the encoding part (down-sampling).
 ndf = {'A': [32, 64, 64, 64, 64, 64, 64], }
@@ -34,35 +31,81 @@ down_activation = {'A': 'leaky_relu', }
 # The activation used in the up-sampling path.
 up_activation = {'A': 'leaky_relu', }
 
-def get_efficientunet_b7(out_channels=2, concat_input=True, pretrained=True):
-    encoder = EfficientNet.encoder('efficientnet-b7', pretrained=pretrained)
-    model = ResUnet(self, out_channels, 0, 'A', 'kaiming', True)
-        
-    return model
+
+def get_blocks_to_be_concat(model, x):
+    shapes = set()
+    blocks = OrderedDict()
+    hooks = []
+    count = 0
+
+    def register_hook(module):
+
+        def hook(module, input, output):
+            try:
+                nonlocal count
+                if module.name == f'blocks_{count}_output_batch_norm':
+                    count += 1
+                    shape = output.size()[-2:]
+                    if shape not in shapes:
+                        shapes.add(shape)
+                        blocks[module.name] = output
+
+                elif module.name == 'head_swish':
+                    # when module.name == 'head_swish', it means the program has already got all necessary blocks for
+                    # concatenation. In my dynamic unet implementation, I first upscale the output of the backbone,
+                    # (in this case it's the output of 'head_swish') concatenate it with a block which has the same
+                    # Height & Width (image size). Therefore, after upscaling, the output of 'head_swish' has bigger
+                    # image size. The last block has the same image size as 'head_swish' before upscaling. So we don't
+                    # really need the last block for concatenation. That's why I wrote `blocks.popitem()`.
+                    blocks.popitem()
+                    blocks[module.name] = output
+
+            except AttributeError:
+                pass
+
+        if (
+                not isinstance(module, nn.Sequential)
+                and not isinstance(module, nn.ModuleList)
+                and not (module == model)
+        ):
+            hooks.append(module.register_forward_hook(hook))
+
+    # register hook
+    model.apply(register_hook)
+
+    # make a forward pass to trigger the hooks
+    model(x)
+
+    # remove these hooks
+    for h in hooks:
+        h.remove()
+
+    return blocks
 
 class ResUnet(torch.nn.Module):
-    def __init__(self, nc_a, nc_b, cfg, init_func, init_to_identity, concat_input=True, out_channels=2, encoder= get_efficientunet_b7(out_channels=2, concat_input=True, pretrained=True)):
-        self.n_channels=nc_a+nc_b
+    def __init__(self, nc_a, nc_b, cfg, init_func, init_to_identity, concat_input=True, out_channels=2, encoder=None):
         
         super().__init__()
 
+        self.conv_same=Conv2dSamePadding(2, 3, 1)
+
         self.encoder = encoder
         self.concat_input = concat_input
-
-        self.up_conv1 = up_conv(self.n_channels, 512)
-        self.double_conv1 = double_conv(self.size[0], 512)
+        self.up_conv1 = up_conv(2560, 512)
+        self.double_conv1 = double_conv(672, 512)
         self.up_conv2 = up_conv(512, 256)
-        self.double_conv2 = double_conv(self.size[1], 256)
+        self.double_conv2 = double_conv(336, 256)
         self.up_conv3 = up_conv(256, 128)
-        self.double_conv3 = double_conv(self.size[2], 128)
+        self.double_conv3 = double_conv(176, 128)
         self.up_conv4 = up_conv(128, 64)
-        self.double_conv4 = double_conv(self.size[3], 64)
+        self.double_conv4 = double_conv(96, 64)
 
+        self.double_conv_input_conv=Conv2dSamePadding(34, 35, 1)
         if self.concat_input:
             self.up_conv_input = up_conv(64, 32)
-            self.double_conv_input = double_conv(self.size[4], 32)
+            self.double_conv_input = double_conv(35, 32)
 
-        self.final_conv = nn.Conv2d(self.size[5], out_channels, kernel_size=1)
+        self.final_conv = nn.Conv2d(32, out_channels, kernel_size=1)
         
     @property
     def n_channels(self):
@@ -78,14 +121,19 @@ class ResUnet(torch.nn.Module):
                      'efficientnet-b6': [656, 328, 168, 96, 35, 32], 'efficientnet-b7': [672, 336, 176, 96, 35, 32]}
         return size_dict[self.encoder.name]
         
-    def forward(self, img_a, img_b):
+    def forward(self, x):
     #def forward(self, x):
-        x = torch.cat([img_a, img_b], 1)
+        if len(x)==2:
+            x = torch.cat(x, 1)
         input_ = x
-
+        print("resUnet forward ", x.shape)
+        if x.shape[1]==2:
+            x=self.conv_same(x)
         blocks = get_blocks_to_be_concat(self.encoder, x)
+        #print("resunet blocks ", blocks)
         _, x = blocks.popitem()
-
+        print("resUnet up_conv1_input ", x.shape)
+    
         x = self.up_conv1(x)
         x = torch.cat([x, blocks.popitem()[1]], dim=1)
         x = self.double_conv1(x)
@@ -105,13 +153,20 @@ class ResUnet(torch.nn.Module):
         if self.concat_input:
             x = self.up_conv_input(x)
             x = torch.cat([x, input_], dim=1)
+            if x.shape[1]==34:
+                x=self.double_conv_input_conv(x)
             x = self.double_conv_input(x)
 
         x = self.final_conv(x)
 
         return x
+      
     
-
+def get_efficientunet_b7(out_channels=2, concat_input=True, pretrained=True):
+    encoder = EfficientNet.encoder('efficientnet-b7', pretrained=pretrained)
+    model = ResUnet(out_channels, 0, 'A', 'kaiming', True, encoder=encoder)
+        
+    return model
     
 class Reg(nn.Module):
     def __init__(self,height,width,in_channels_a,in_channels_b):
@@ -127,7 +182,7 @@ class Reg(nn.Module):
         self.in_channels_a = in_channels_a
         self.in_channels_b = in_channels_b
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.offset_map = ResUnet(self.in_channels_a, self.in_channels_b, cfg='A', init_func=init_func, init_to_identity=init_to_identity).to(
+        self.offset_map = ResUnet(self.in_channels_a, self.in_channels_b, cfg='A', init_func=init_func, init_to_identity=init_to_identity, encoder=get_efficientunet_b7()).to(
             self.device)
         self.identity_grid = self.get_identity_grid()
 
@@ -141,7 +196,7 @@ class Reg(nn.Module):
         return identity
 
     def forward(self, img_a, img_b, apply_on=None):
-
-        deformations = self.offset_map(img_a, img_b)
+        print("reg forward", img_a.shape, img_b.shape)
+        deformations = self.offset_map([img_a, img_b])
 
         return deformations
