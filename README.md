@@ -1,58 +1,18 @@
-# Breaking the Dilemma of Medical Image-to-image Translation
-![bat](./p2pcycreg.png)
+# RegGAN-EfficientUNet
+This project is based on RegGAN [[code](https://github.com/Kid-Liet/Reg-GAN)] [[paper](https://arxiv.org/pdf/2110.06465.pdf)]
 
-Get the full paper on [Arxiv](https://arxiv.org/pdf/2110.06465.pdf).
-This paper has been accepted by [NeurIPS 2021 (Spotlight)](https://openreview.net/forum?id=C0GmZH2RnVR&referrer=%5BAuthor%20Console%5D(%2Fgroup%3Fid%3DNeurIPS.cc%2F2021%2FConference%2FAuthors%23your-submissions)).
+# Overview
+RegGAN stands as a groundbreaking model crafted specifically to tackle the constraints that have hampered the efficacy of prevailing image-to-image translation models such as Pix2Pix and CycleGAN. The distinguishing feature of RegGAN lies in its innovative treatment of unaligned images within the training data. It perceives these unaligned images as noisy labels and artfully employs a registration network to harmonize them with the disordered noise distribution.   
 
-## Main Reference Environment
-1. Linux         (Titan RTX)
-2. Python        (3.6.6)
-3. torch         (1.9.0+cu111)
-5. visdom        (0.1.8.9)
-6. numpy         (1.19.2)
-7. skimage       (0.15.0)
-8. Yaml          (5.4.1)
-9. cv2           (3.4.2)
-10. PIL          (8.3.2)
+This novel approach propels RegGAN to outperform Pix2Pix and Cycle-GAN without necessitating the inclusion of "well-aligned image pairs" in the training dataset. What sets RegGAN apart is its remarkable adaptability, seamlessly integrating into pre-existing models without necessitating any modifications to their original architectural design. Furthermore, RegGAN achieves these commendable results while demanding a reduced parameter count, thus enhancing overall performance efficiency.   
 
-## Usage
-1. Create dataset
-   -  train path/A/
-   -  train path/B/
-   -  val path/A/
-   -  val path/B/ 
-2. The default data file form is .npy and normalized to [-1,1].
-3. Modify the parameters in the .yaml file as needed:
-   -  **bidirect**: whether to use bidirectional network, corresponding to the C or NC mode in the paper.
-   -  **regist**: whether the registration network is used, corresponding to the +R mode in the paper.
-   - **noise_level**: set to 0 if you do not want to use noise.
-   - **port**: port parameters of visdom.
-4. Default RegGAN mode (bidirect:**False**    regist:**True**).
-5. Start visdom：
- ```
-python -m visdom.server -p 6019
-```
-If other port parameters are used, you need to modify the port in yaml.
+Within the context of this research paper, we opted for the utilization of the U-Net as our chosen registration network. While the paper presents this choice without extensive elaboration, it prompts intriguing inquiries. Specifically, we contemplate whether alterations in the depth of the U-Net or the introduction of an Efficient-Unet can yield both a more streamlined model and performance enhancements worth exploring in the future.   
 
-6. Train:
- ```
-python train.py
-```
-## Trained Weights
-We provide Pix2pix, CycleGAN, RegGAN trained weights under the condition of Noise.0:
-https://drive.google.com/file/d/1xWXB9u6dQ9ZytmgQl_0ph4H_Ivtd41zJ/view?usp=sharing
--  Pix2pix_noise0
--  CycleGAN_noise0
--  RegGAN_noise0
+# Training
 
-## Processed data
-We provide some processed data for your convenience：
-https://drive.google.com/file/d/1PiTzGQEVV7NO4nPaHeQv61WgDxoD76nL/view?usp=sharing
-
+# Result
 
 ## Citation
-
-If you find RegGAN useful in your research, please consider citing:
 
 ```
 @inproceedings{
